@@ -101,6 +101,229 @@ def merge_stats(a: Stats, b: Stats) -> Stats:
     )
 
 
+def _insert_block(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_index: int,
+    st: Stats,
+    first_rowid: int,
+    last_rowid: int,
+) -> None:
+    conn.execute(
+        f"""INSERT INTO blocks (
+                test_id, level, block_index,
+                start_ts, end_ts,
+                {", ".join(_BLOCK_FIELDS)},
+                first_rowid, last_rowid
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                {", ".join("?" for _ in _BLOCK_FIELDS)},
+                ?, ?
+            )""",
+        (
+            test_id,
+            level,
+            block_index,
+            st.first_ts,
+            st.last_ts,
+            *st.to_tuple(),
+            first_rowid,
+            last_rowid,
+        ),
+    )
+
+
+def _update_tail_block(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_index: int,
+    st: Stats,
+    last_rowid: int,
+) -> None:
+    """用合并后的统计原地重写尾部块（start_ts / first_* / first_rowid 不变）。"""
+    sets = ", ".join(f"{f} = ?" for f in ("end_ts", *_BLOCK_FIELDS, "last_rowid"))
+    conn.execute(
+        f"UPDATE blocks SET {sets} "
+        "WHERE test_id = ? AND level = ? AND block_index = ?",
+        (st.last_ts, *st.to_tuple(), last_rowid, test_id, level, block_index),
+    )
+
+
+def append_summaries(
+    conn: sqlite3.Connection,
+    test_id: int,
+    block_size: int,
+) -> int:
+    """把已写入 samples 的接续采样并入多级摘要，返回新的最高 level。
+
+    只动各级“受影响的尾部”，绝不重扫旧采样：
+    - level 1：先用新采样填满既有尾部半块（统计直接合并），再按 block_size 切新块；
+    - level k>1：受影响子块在每层都构成连续后缀，重查这些子块的摘要后，
+      原地重写覆盖它们的既有父块，并为超出覆盖范围的子块组新父块；
+    - 顶层因此产生多于一个父块时自动加层，直到顶层只剩一块。
+
+    调用方负责事务与“新采样 rowid 均大于旧 rowid”的前提。
+    """
+    old_top = conn.execute(
+        "SELECT COALESCE(MAX(level), 0) FROM blocks WHERE test_id = ?", (test_id,)
+    ).fetchone()[0]
+    if old_top == 0:
+        raise ValueError("试验尚无摘要块，无法接续")
+
+    old_last_rid = conn.execute(
+        "SELECT last_rowid FROM blocks WHERE test_id = ? AND level = 1 "
+        "ORDER BY block_index DESC LIMIT 1",
+        (test_id,),
+    ).fetchone()[0]
+
+    new_rows = conn.execute(
+        "SELECT rowid AS rid, ts, pressure FROM samples "
+        "WHERE test_id = ? AND rowid > ? ORDER BY rowid",
+        (test_id, old_last_rid),
+    ).fetchall()
+    if not new_rows:
+        return old_top  # 全部为重叠去重行，没有新采样，摘要不变
+
+    # ---- level 1：填满尾部半块，再切新块 ----
+    tail = conn.execute(
+        "SELECT * FROM blocks WHERE test_id = ? AND level = 1 "
+        "ORDER BY block_index DESC LIMIT 1",
+        (test_id,),
+    ).fetchone()
+    tail_idx = tail["block_index"]
+    tail_st = Stats.from_row(tail)
+    free = block_size - tail["sample_count"]
+    cursor = 0
+    if free > 0:
+        fill = new_rows[:free]
+        for row in fill:
+            tail_st = merge_stats(tail_st, stats_from_sample(row["ts"], row["pressure"]))
+        _update_tail_block(
+            conn, test_id, 1, tail_idx, tail_st, fill[-1]["rid"]
+        )
+        cursor = len(fill)
+
+    next_idx = tail_idx + 1
+    while cursor < len(new_rows):
+        chunk = new_rows[cursor : cursor + block_size]
+        st = Stats()
+        for row in chunk:
+            st = merge_stats(st, stats_from_sample(row["ts"], row["pressure"]))
+        _insert_block(conn, test_id, 1, next_idx, st, chunk[0]["rid"], chunk[-1]["rid"])
+        next_idx += 1
+        cursor += len(chunk)
+
+    # 受影响 level-1 后缀的起点：处理前最后一个既有受影响块（被重写的尾部
+    # 半块）；若尾部块原本已满，没有旧块被重写，则后缀从第一个新建块开始。
+    # 用 aff_prev_end 表示“处理前后缀的最后一个子块下标”，-1 代表后缀全是新块。
+    aff_prev_end = tail_idx if tail["sample_count"] < block_size else -1
+
+    # ---- level 2+：逐级向上重写受影响的尾部父块，必要时加层 ----
+    # 每层只维护 aff_prev_end：处理前受影响后缀的最后一个子块下标
+    # （-1 表示后缀全是新块）。重写从后缀首子块（aff_prev_end+1）所属父槽
+    # 起，到当前尾部父槽全部重算，再为超出覆盖的子块新建父槽。
+    # 全程只重查受影响子块的摘要块，不触碰原始采样。
+    level = 2
+    while True:
+        tail_idx_row = conn.execute(
+            "SELECT MAX(block_index) FROM blocks WHERE test_id = ? AND level = ?",
+            (test_id, level),
+        ).fetchone()
+
+        if tail_idx_row[0] is None:
+            # 本层尚不存在 -> 加层：上一层全部块作为输入（读摘要块，不读采样）
+            child_rows = conn.execute(
+                "SELECT * FROM blocks WHERE test_id = ? AND level = ? "
+                "ORDER BY block_index",
+                (test_id, level - 1),
+            ).fetchall()
+            parent_idx = 0
+            for i in range(0, len(child_rows), block_size):
+                group = child_rows[i : i + block_size]
+                st = Stats()
+                for r in group:
+                    st = merge_stats(st, Stats.from_row(r))
+                _insert_block(
+                    conn, test_id, level, parent_idx, st,
+                    group[0]["first_rowid"], group[-1]["last_rowid"],
+                )
+                parent_idx += 1
+            # 新层的块全部是新建的，没有“处理前的旧部分”
+            aff_prev_end = -1
+        else:
+            tail_parent_idx = tail_idx_row[0]
+            child_count = conn.execute(
+                "SELECT COUNT(*) FROM blocks WHERE test_id = ? AND level = ?",
+                (test_id, level - 1),
+            ).fetchone()[0]
+            # 受影响后缀在本层覆盖的第一个父槽。后缀的第一个子块下标为
+            # aff_prev_end+1（aff_prev_end=-1 时即 0）：新建子块若落进某个
+            # 既有父槽，该槽同样要重算，因此起点必须按“后缀首子块”定位，
+            # 不能只按处理前的旧部分末子块定位。
+            first_suffix_child = aff_prev_end + 1
+            first_existing_to_rewrite = min(
+                tail_parent_idx, first_suffix_child // block_size
+            )
+
+            # 1) 重写从首个受影响父槽到当前尾部父槽的全部既有父槽
+            for p_idx in range(first_existing_to_rewrite, tail_parent_idx + 1):
+                slot_first = p_idx * block_size
+                kids = conn.execute(
+                    "SELECT * FROM blocks WHERE test_id = ? AND level = ? "
+                    "AND block_index >= ? AND block_index < ? ORDER BY block_index",
+                    (
+                        test_id,
+                        level - 1,
+                        slot_first,
+                        slot_first + block_size,
+                    ),
+                ).fetchall()
+                st = Stats()
+                for r in kids:
+                    st = merge_stats(st, Stats.from_row(r))
+                _update_tail_block(
+                    conn, test_id, level, p_idx, st, kids[-1]["last_rowid"]
+                )
+
+            # 2) 超出既有父槽覆盖范围的子块：按 block_size 组新父槽
+            new_parent_idx = tail_parent_idx + 1
+            for start in range(new_parent_idx * block_size, child_count, block_size):
+                kids = conn.execute(
+                    "SELECT * FROM blocks WHERE test_id = ? AND level = ? "
+                    "AND block_index >= ? AND block_index < ? ORDER BY block_index",
+                    (
+                        test_id,
+                        level - 1,
+                        start,
+                        start + block_size,
+                    ),
+                ).fetchall()
+                st = Stats()
+                for r in kids:
+                    st = merge_stats(st, Stats.from_row(r))
+                _insert_block(
+                    conn, test_id, level, new_parent_idx, st,
+                    kids[0]["first_rowid"], kids[-1]["last_rowid"],
+                )
+                new_parent_idx += 1
+
+            # 下一层视角的 aff_prev_end：处理前最后一个受影响子块所属的父槽
+            # 下标（本层块即下一层的子块）；全部是新父槽时记 -1。
+            aff_prev_end = (
+                aff_prev_end // block_size if aff_prev_end >= 0 else -1
+            )
+
+        total_at_level = conn.execute(
+            "SELECT COUNT(*) FROM blocks WHERE test_id = ? AND level = ?",
+            (test_id, level),
+        ).fetchone()[0]
+        if total_at_level == 1:
+            return level
+        level += 1
+
+
 def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> int:
     """为已写入 samples 的试验构建全部摘要层级，返回最高 level。
 
@@ -119,28 +342,7 @@ def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> 
 
     def flush(level: int, entries: list[tuple]) -> None:
         for idx, (st, first_rid, last_rid) in enumerate(entries):
-            conn.execute(
-                f"""INSERT INTO blocks (
-                        test_id, level, block_index,
-                        start_ts, end_ts,
-                        {", ".join(_BLOCK_FIELDS)},
-                        first_rowid, last_rowid
-                    ) VALUES (
-                        ?, ?, ?, ?, ?,
-                        {", ".join("?" for _ in _BLOCK_FIELDS)},
-                        ?, ?
-                    )""",
-                (
-                    test_id,
-                    level,
-                    idx,
-                    st.first_ts,
-                    st.last_ts,
-                    *st.to_tuple(),
-                    first_rid,
-                    last_rid,
-                ),
-            )
+            _insert_block(conn, test_id, level, idx, st, first_rid, last_rid)
 
     # ---- level 1：原始采样分块 ----
     entries: list[tuple] = []

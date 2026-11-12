@@ -61,3 +61,10 @@ class ImportResponse(TestOut):
     block_counts: dict[str, int] = Field(
         ..., description="每个摘要层级生成的块数"
     )
+
+
+class AppendResponse(ImportResponse):
+    appended_count: int = Field(..., description="本次实际新增的采样点数（晚于库内末点）")
+    overlap_count: int = Field(
+        ..., description="与库内末点之前时刻重叠、核对一致后去重的行数"
+    )

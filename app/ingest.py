@@ -14,7 +14,7 @@ import math
 import sqlite3
 
 from . import config
-from .summaries import build_summaries
+from .summaries import append_summaries, build_summaries
 
 
 class CsvValidationError(ValueError):
@@ -159,4 +159,107 @@ def import_test(
         "max_level": max_level,
         "imported_at": imported_at,
         "block_counts": {str(k): v for k, v in sorted(block_counts.items())},
+    }
+
+
+# IN 子句分批，避免触碰 SQLite 绑定变量上限
+_LOOKUP_BATCH = 500
+
+
+def _lookup_pressures(
+    conn: sqlite3.Connection, test_id: int, timestamps: list[int]
+) -> dict[int, float]:
+    found: dict[int, float] = {}
+    for i in range(0, len(timestamps), _LOOKUP_BATCH):
+        chunk = timestamps[i : i + _LOOKUP_BATCH]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT ts, pressure FROM samples "
+            f"WHERE test_id = ? AND ts IN ({placeholders})",
+            (test_id, *chunk),
+        ).fetchall()
+        for r in rows:
+            found[r["ts"]] = r["pressure"]
+    return found
+
+
+def append_test(
+    conn: sqlite3.Connection,
+    test_id: int,
+    filename: str,
+    content: bytes,
+    block_size: int | None = None,
+) -> dict:
+    """把同格式 CSV 接续到已入库试验，单事务完成，失败则原试验不变。
+
+    契约：
+    - 文件内时间戳仍须严格递增、压力为有限值（坏行整份退回）；
+    - 不晚于库内末点 end_ts 的行属于重叠区，必须逐行命中同毫秒、同压力
+      的既有采样，匹配行去重不入库；对不上即整份退回；
+    - 只追加严格晚于 end_ts 的采样，返回新增点数；
+    - 采样、试验元信息与尾部摘要在同一事务内生效。
+    """
+    block_size = block_size or config.BLOCK_SIZE
+    samples = parse_csv(content)  # 解析失败在此抛出，尚未写任何数据
+
+    test = conn.execute(
+        "SELECT * FROM tests WHERE id = ?", (test_id,)
+    ).fetchone()
+    if test is None:
+        raise KeyError(f"试验 {test_id} 不存在")
+
+    end_ts = test["end_ts"]
+    split = 0
+    while split < len(samples) and samples[split][0] <= end_ts:
+        split += 1
+    overlap = samples[:split]
+    new_part = samples[split:]
+
+    if overlap:
+        existing = _lookup_pressures(conn, test_id, [ts for ts, _ in overlap])
+        for ts, pressure in overlap:
+            db_pressure = existing.get(ts)
+            if db_pressure is None:
+                raise CsvValidationError(
+                    f"重叠时刻 {ts} 在库内找不到同毫秒采样，整份文件退回，原试验不变"
+                )
+            if db_pressure != pressure:
+                raise CsvValidationError(
+                    f"重叠时刻 {ts} 压力对不上：文件 {pressure} kPa，"
+                    f"库内 {db_pressure} kPa；整份文件退回，原试验不变"
+                )
+
+    if new_part:
+        conn.executemany(
+            "INSERT INTO samples (test_id, ts, pressure) VALUES (?, ?, ?)",
+            [(test_id, ts, p) for ts, p in new_part],
+        )
+        max_level = append_summaries(conn, test_id, block_size)
+        appended_count = len(new_part)
+        conn.execute(
+            "UPDATE tests SET sample_count = sample_count + ?, "
+            "end_ts = ?, max_level = ? WHERE id = ?",
+            (appended_count, new_part[-1][0], max_level, test_id),
+        )
+    else:
+        # 全部是已入库的重叠采样：试验与摘要保持原样
+        max_level = test["max_level"]
+        appended_count = 0
+
+    block_counts = dict(
+        conn.execute(
+            "SELECT level, COUNT(*) FROM blocks WHERE test_id = ? GROUP BY level",
+            (test_id,),
+        ).fetchall()
+    )
+    row = conn.execute(
+        "SELECT id, name, source_filename, sample_count, start_ts, end_ts, "
+        "max_level, imported_at FROM tests WHERE id = ?",
+        (test_id,),
+    ).fetchone()
+    return {
+        **dict(row),
+        "block_counts": {str(k): v for k, v in sorted(block_counts.items())},
+        "appended_count": appended_count,
+        "overlap_count": len(overlap),
     }

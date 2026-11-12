@@ -12,8 +12,8 @@ from sqlite3 import Connection
 
 from . import config
 from .db import init_db, session
-from .ingest import CsvValidationError, import_test
-from .schemas import ImportResponse, QueryResponse, TestOut
+from .ingest import CsvValidationError, append_test, import_test
+from .schemas import AppendResponse, ImportResponse, QueryResponse, TestOut
 from .service import bucket_query
 
 
@@ -26,11 +26,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="泵站启泵试验水锤压力分析",
     description=(
-        "导入记录仪单次试验 CSV（毫秒时间戳、kPa 压力），"
-        "在 SQLite 中保存原始采样与多级摘要；按起止时刻与桶宽分桶，"
+        "导入记录仪试验 CSV（毫秒时间戳、kPa 压力），在 SQLite 中保存原始采样与"
+        "多级摘要；支持按试验编号接续上传同格式 CSV，重叠采样逐行核对去重，"
+        "只追加新采样并增量更新尾部摘要。按起止时刻与桶宽分桶，"
         "返回每桶首/尾/最高/最低点，空桶标记为缺测。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -70,6 +71,35 @@ def upload_test(
     except CsvValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return result
+
+
+@app.post(
+    "/tests/{test_id}/append",
+    response_model=AppendResponse,
+    tags=["试验导入"],
+    summary="按试验编号上传接续 CSV（重叠行逐行核对去重，只追加新采样）",
+)
+def append_to_test(
+    test_id: int,
+    file: UploadFile = File(..., description="与首次导入同格式的记录仪 CSV，首行表头"),
+    conn: Connection = Depends(get_conn),
+):
+    content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
+    if len(content) > config.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过 {config.MAX_UPLOAD_BYTES} 字节上限",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    try:
+        return append_test(
+            conn, test_id=test_id, filename=file.filename or "", content=content
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except CsvValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.get("/tests", response_model=list[TestOut], tags=["试验查询"], summary="列出全部试验")

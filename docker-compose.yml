@@ -1,7 +1,7 @@
 services:
   pump-api:
     build: .
-    image: pump-hammer-api:1.0.0
+    image: pump-hammer-api:1.1.0
     container_name: pump-hammer-api
     ports:
       - "8000:8000"
