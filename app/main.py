@@ -12,8 +12,8 @@ from sqlite3 import Connection
 
 from . import config
 from .db import init_db, session
-from .ingest import CsvValidationError, import_test
-from .schemas import ImportResponse, QueryResponse, TestOut
+from .ingest import CsvValidationError, append_test, import_test
+from .schemas import AppendResponse, ImportResponse, QueryResponse, TestOut
 from .service import bucket_query
 
 
@@ -70,6 +70,36 @@ def upload_test(
     except CsvValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return result
+
+
+@app.post(
+    "/tests/{test_id}/append",
+    response_model=AppendResponse,
+    status_code=200,
+    tags=["试验导入"],
+    summary="按试验编号上传接续 CSV，只追加晚于末点的采样",
+)
+def append_test_file(
+    test_id: int,
+    file: UploadFile = File(..., description="与首次导入同格式的记录仪 CSV，可与库内尾部重叠"),
+    conn: Connection = Depends(get_conn),
+):
+    content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
+    if len(content) > config.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过 {config.MAX_UPLOAD_BYTES} 字节上限",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    try:
+        return append_test(
+            conn, test_id=test_id, filename=file.filename or "", content=content
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except CsvValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.get("/tests", response_model=list[TestOut], tags=["试验查询"], summary="列出全部试验")

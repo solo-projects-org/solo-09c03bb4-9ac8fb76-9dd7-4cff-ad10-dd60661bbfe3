@@ -61,3 +61,16 @@ class ImportResponse(TestOut):
     block_counts: dict[str, int] = Field(
         ..., description="每个摘要层级生成的块数"
     )
+
+
+class AppendResponse(TestOut):
+    appended_filename: str = Field(..., description="本次接续上传的文件名")
+    appended_count: int = Field(
+        ..., description="本次实际新增入库的采样点数（晚于原末点的行）"
+    )
+    overlap_matched: int = Field(
+        ..., description="与库内同毫秒同压力匹配、未重复入库的重叠行数"
+    )
+    block_counts: dict[str, int] = Field(
+        ..., description="接续完成后每个摘要层级的块数"
+    )

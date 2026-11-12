@@ -101,6 +101,182 @@ def merge_stats(a: Stats, b: Stats) -> Stats:
     )
 
 
+def _insert_block(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_index: int,
+    st: Stats,
+    first_rowid: int,
+    last_rowid: int,
+) -> None:
+    conn.execute(
+        f"""INSERT INTO blocks (
+                test_id, level, block_index,
+                start_ts, end_ts,
+                {", ".join(_BLOCK_FIELDS)},
+                first_rowid, last_rowid
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                {", ".join("?" for _ in _BLOCK_FIELDS)},
+                ?, ?
+            )""",
+        (
+            test_id,
+            level,
+            block_index,
+            st.first_ts,
+            st.last_ts,
+            *st.to_tuple(),
+            first_rowid,
+            last_rowid,
+        ),
+    )
+
+
+# UPDATE 时需要刷新的列（主键 test_id/level/block_index 除外）
+_UPDATE_COLUMNS = (
+    "start_ts",
+    "end_ts",
+    *_BLOCK_FIELDS,
+    "first_rowid",
+    "last_rowid",
+)
+
+
+def _update_block(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_index: int,
+    st: Stats,
+    first_rowid: int,
+    last_rowid: int,
+) -> None:
+    sets = ", ".join(f"{col} = ?" for col in _UPDATE_COLUMNS)
+    conn.execute(
+        f"UPDATE blocks SET {sets} "
+        "WHERE test_id = ? AND level = ? AND block_index = ?",
+        (
+            st.first_ts,
+            st.last_ts,
+            *st.to_tuple(),
+            first_rowid,
+            last_rowid,
+            test_id,
+            level,
+            block_index,
+        ),
+    )
+
+
+def append_summaries(
+    conn: sqlite3.Connection,
+    test_id: int,
+    new_rows: list,
+    block_size: int,
+) -> int:
+    """把一批新采样（已写入 samples）增量并入多级摘要，返回新的 max_level。
+
+    只更新各级“受影响的尾部摘要块”，必要时在顶层新增一层；
+    全程只读取既有摘要块与新采样，**不重扫历史原始采样**。
+    调用方负责事务管理。
+
+    - level 1：先把末个未满块补齐（UPDATE），其余新点按 block_size 切块新增；
+    - level k>=2：受影响子块必在尾部，定位到首个受影响父块，删除该块及其后
+      的旧块，再用子块摘要重新合并出这些父块；
+    - 顶层由 1 块涨成多块时，再加一层把它们收束成 1 块。
+    """
+    if not new_rows:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(level), 0) FROM blocks WHERE test_id = ?",
+            (test_id,),
+        ).fetchone()
+        return row[0]
+
+    # ---------------- level 1：补齐尾部半块 + 追加新块 ----------------
+    last_l1 = conn.execute(
+        "SELECT * FROM blocks WHERE test_id = ? AND level = 1 "
+        "ORDER BY block_index DESC LIMIT 1",
+        (test_id,),
+    ).fetchone()
+
+    pos = 0
+    if last_l1 is not None:
+        next_index = last_l1["block_index"] + 1
+        first_changed_l1 = last_l1["block_index"]
+        remaining = block_size - last_l1["sample_count"]
+        if remaining > 0:
+            fill = new_rows[:remaining]
+            st = Stats.from_row(last_l1)
+            for r in fill:
+                st = merge_stats(st, stats_from_sample(r["ts"], r["pressure"]))
+            _update_block(
+                conn, test_id, 1, last_l1["block_index"], st,
+                last_l1["first_rowid"], fill[-1]["rid"],
+            )
+            pos = len(fill)
+        else:
+            # 末块已满，没有需要就地更新的 level 1 块
+            first_changed_l1 = next_index
+    else:
+        next_index = 0
+        first_changed_l1 = 0
+
+    while pos < len(new_rows):
+        group = new_rows[pos : pos + block_size]
+        st = Stats()
+        for r in group:
+            st = merge_stats(st, stats_from_sample(r["ts"], r["pressure"]))
+        _insert_block(
+            conn, test_id, 1, next_index, st, group[0]["rid"], group[-1]["rid"]
+        )
+        next_index += 1
+        pos += len(group)
+
+    # ---------------- level 2+：自底向上只重建受影响的尾部父块 ----------------
+    old_max = conn.execute(
+        "SELECT COALESCE(MAX(level), 0) FROM blocks WHERE test_id = ?",
+        (test_id,),
+    ).fetchone()[0]
+
+    level = 2
+    first_changed_child = first_changed_l1
+    while True:
+        parent_start = first_changed_child // block_size
+        # 首个受影响父块及其后的旧块全部废弃，稍后按子块摘要重建
+        conn.execute(
+            "DELETE FROM blocks WHERE test_id = ? AND level = ? AND block_index >= ?",
+            (test_id, level, parent_start),
+        )
+        child_start = parent_start * block_size
+        children = conn.execute(
+            "SELECT * FROM blocks WHERE test_id = ? AND level = ? AND block_index >= ? "
+            "ORDER BY block_index",
+            (test_id, level - 1, child_start),
+        ).fetchall()
+
+        parent_index = parent_start
+        for i in range(0, len(children), block_size):
+            group = children[i : i + block_size]
+            st = Stats()
+            for child in group:
+                st = merge_stats(st, Stats.from_row(child))
+            _insert_block(
+                conn, test_id, level, parent_index, st,
+                group[0]["first_rowid"], group[-1]["last_rowid"],
+            )
+            parent_index += 1
+
+        block_count_at_level = parent_index
+        # 顶层（含本次新加的层）最终只剩 1 块，摘要树重新收敛，结束
+        if level > old_max or block_count_at_level <= 1:
+            return level
+        # 本层仍有多块，且首个重建父块可能不是 0 号 -> 继续向上更新尾部
+        first_changed_child = parent_start
+        level += 1
+
+
 def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> int:
     """为已写入 samples 的试验构建全部摘要层级，返回最高 level。
 

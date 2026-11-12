@@ -5,8 +5,10 @@
     python3 scripts/generate_sample.py
 
 输出：
-    sample_data/pump_start_demo.csv   2 万点、含启泵水锤振荡与尖峰深谷
-    sample_data/small_demo.csv        60 点小样本，便于在 Swagger 里肉眼核对
+    sample_data/pump_start_demo.csv        2 万点、含启泵水锤振荡与尖峰深谷
+    sample_data/small_demo.csv             60 点小样本，便于在 Swagger 里肉眼核对
+    sample_data/pump_start_part1.csv       接续演示第 1 段（1.2 万点，先导入）
+    sample_data/pump_start_part2.csv       接续演示第 2 段（与第 1 段重叠 500 点）
 列：timestamp_ms,pressure_kpa；毫秒时间戳严格递增。
 """
 
@@ -42,20 +44,38 @@ def pressure_at(t_ms: int) -> float:
     return round(p, 3)
 
 
-def write_csv(path: Path, count: int, interval_ms: int) -> None:
+def write_csv(path: Path, start_index: int, count: int, interval_ms: int) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp_ms", "pressure_kpa"])
-        for i in range(count):
+        for i in range(start_index, start_index + count):
             ts = BASE_TS + i * interval_ms
             writer.writerow([ts, pressure_at(i * interval_ms)])
-    print(f"wrote {path} ({count} rows)")
+    print(f"wrote {path} ({count} rows, index {start_index}..{start_index + count - 1})")
 
 
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-    write_csv(OUT_DIR / "pump_start_demo.csv", count=20_000, interval_ms=10)
-    write_csv(OUT_DIR / "small_demo.csv", count=60, interval_ms=100)
+    write_csv(OUT_DIR / "pump_start_demo.csv", start_index=0, count=20_000, interval_ms=10)
+    write_csv(OUT_DIR / "small_demo.csv", start_index=0, count=60, interval_ms=100)
+
+    # 接续演示：同一次启泵试验被记录仪切成两段，part2 开头与 part1 末尾
+    # 重叠 500 个采样（同毫秒同压力），接续后总点数 24000。
+    overlap = 500
+    part1_count = 12_000
+    part2_count = 12_500
+    write_csv(
+        OUT_DIR / "pump_start_part1.csv",
+        start_index=0,
+        count=part1_count,
+        interval_ms=10,
+    )
+    write_csv(
+        OUT_DIR / "pump_start_part2.csv",
+        start_index=part1_count - overlap,
+        count=part2_count,
+        interval_ms=10,
+    )
 
 
 if __name__ == "__main__":

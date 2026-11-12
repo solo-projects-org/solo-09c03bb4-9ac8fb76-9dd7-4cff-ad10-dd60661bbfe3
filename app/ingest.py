@@ -14,7 +14,8 @@ import math
 import sqlite3
 
 from . import config
-from .summaries import build_summaries
+from . import config
+from .summaries import append_summaries, build_summaries
 
 
 class CsvValidationError(ValueError):
@@ -158,5 +159,103 @@ def import_test(
         "end_ts": samples[-1][0],
         "max_level": max_level,
         "imported_at": imported_at,
+        "block_counts": {str(k): v for k, v in sorted(block_counts.items())},
+    }
+
+
+def append_test(
+    conn: sqlite3.Connection,
+    test_id: int,
+    filename: str,
+    content: bytes,
+    block_size: int | None = None,
+) -> dict:
+    """把同格式 CSV 接续到已入库试验，单事务完成（失败整份退回，原试验不变）。
+
+    契约：
+    - 上传行时刻不晚于库内末点的，必须在库内存在同毫秒、同压力的采样，
+      这些重叠行视为重复，不再入库；对不上（缺时刻或压力不一致）整份拒绝；
+    - 只入库严格晚于库内末点的采样，返回新增点数；
+    - 摘要走增量尾部更新（append_summaries），不重扫历史采样。
+    """
+    block_size = block_size or config.BLOCK_SIZE
+    samples = parse_csv(content)
+
+    test = conn.execute("SELECT * FROM tests WHERE id = ?", (test_id,)).fetchone()
+    if test is None:
+        raise KeyError(f"试验 {test_id} 不存在")
+
+    last_ts = test["end_ts"]
+    overlap = [(ts, p) for ts, p in samples if ts <= last_ts]
+    new_samples = [(ts, p) for ts, p in samples if ts > last_ts]
+
+    # 重叠段逐点核对：同毫秒、同压力，否则整份退回
+    if overlap:
+        placeholders = ", ".join("?" for _ in overlap)
+        stored = {
+            (r["ts"], r["pressure"])
+            for r in conn.execute(
+                f"SELECT ts, pressure FROM samples "
+                f"WHERE test_id = ? AND ts IN ({placeholders})",
+                (test_id, *[ts for ts, _ in overlap]),
+            ).fetchall()
+        }
+        for ts, pressure in overlap:
+            if (ts, pressure) not in stored:
+                raise CsvValidationError(
+                    f"接续文件与库内采样在时刻 {ts} 对不上"
+                    "（缺少同毫秒同压力的采样），整份退回，原试验不变"
+                )
+
+    if new_samples:
+        before_max_rowid = conn.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM samples WHERE test_id = ?",
+            (test_id,),
+        ).fetchone()[0]
+
+        conn.executemany(
+            "INSERT INTO samples (test_id, ts, pressure) VALUES (?, ?, ?)",
+            [(test_id, ts, p) for ts, p in new_samples],
+        )
+        new_rows = conn.execute(
+            "SELECT rowid AS rid, ts, pressure FROM samples "
+            "WHERE test_id = ? AND rowid > ? ORDER BY rowid",
+            (test_id, before_max_rowid),
+        ).fetchall()
+        max_level = append_summaries(conn, test_id, new_rows, block_size)
+        new_end_ts = new_samples[-1][0]
+        new_count = test["sample_count"] + len(new_samples)
+    else:
+        # 全部是已匹配的重叠行：无新增，摘要与试验均不变
+        max_level = test["max_level"]
+        new_end_ts = last_ts
+        new_count = test["sample_count"]
+
+    conn.execute(
+        "UPDATE tests SET sample_count = ?, end_ts = ?, max_level = ? WHERE id = ?",
+        (new_count, new_end_ts, max_level, test_id),
+    )
+
+    block_counts = dict(
+        conn.execute(
+            "SELECT level, COUNT(*) FROM blocks WHERE test_id = ? GROUP BY level",
+            (test_id,),
+        ).fetchall()
+    )
+    refreshed = conn.execute(
+        "SELECT * FROM tests WHERE id = ?", (test_id,)
+    ).fetchone()
+    return {
+        "id": test_id,
+        "name": refreshed["name"],
+        "source_filename": test["source_filename"],
+        "appended_filename": filename,
+        "sample_count": new_count,
+        "appended_count": len(new_samples),
+        "overlap_matched": len(overlap),
+        "start_ts": refreshed["start_ts"],
+        "end_ts": new_end_ts,
+        "max_level": max_level,
+        "imported_at": refreshed["imported_at"],
         "block_counts": {str(k): v for k, v in sorted(block_counts.items())},
     }
